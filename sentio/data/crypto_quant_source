@@ -1,0 +1,334 @@
+# sentio/data/crypto_quant_source.py
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Optional
+import requests
+import logging
+import time
+from datetime import datetime, timedelta
+
+from dummy_modules import DummyDataSource as DataSource
+
+class CryptoQuantSource(DataSource):
+    """
+    Data source for CryptoQuant API.
+    
+    This class handles fetching and processing data from CryptoQuant,
+    which provides on-chain metrics for cryptocurrencies.
+    """
+    
+    def __init__(
+        self,
+        api_key: str,
+        asset: str = 'btc',
+        interval: str = '1d',
+        rate_limit_pause: float = 1.0
+    ):
+        """
+        Initialize the CryptoQuant data source.
+        
+        Args:
+            api_key: CryptoQuant API key
+            asset: Asset symbol (default: 'btc')
+            interval: Data interval ('1d', '1h', etc.)
+            rate_limit_pause: Pause between API calls to avoid rate limits
+        """
+        self.api_key = api_key
+        self.asset = asset.lower()
+        self.interval = interval
+        self.rate_limit_pause = rate_limit_pause
+        self.base_url = "https://api.cryptoquant.com/v1"
+        
+    def fetch_data(
+        self,
+        start_date: str,
+        end_date: str,
+        metrics: List[str]
+    ) -> pd.DataFrame:
+        """
+        Fetch data from CryptoQuant API.
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            metrics: List of metric names to fetch
+            
+        Returns:
+            DataFrame with requested metrics
+        """
+        # Convert dates to datetime objects
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
+        # Initialize empty DataFrame for results
+        all_data = pd.DataFrame()
+        
+        # Fetch each metric
+        for metric in metrics:
+            try:
+                metric_data = self._fetch_metric(metric, start_dt, end_dt)
+                
+                # If first metric, use as base DataFrame
+                if all_data.empty:
+                    all_data = metric_data
+                else:
+                    # Otherwise, merge on timestamp
+                    all_data = pd.merge(
+                        all_data,
+                        metric_data,
+                        on='timestamp',
+                        how='outer'
+                    )
+                    
+                # Respect rate limits
+                time.sleep(self.rate_limit_pause)
+                
+            except Exception as e:
+                logging.error(f"Failed to fetch metric {metric}: {str(e)}")
+                # Continue with other metrics even if one fails
+                continue
+                
+        # Ensure data is sorted by timestamp
+        if not all_data.empty:
+            all_data.sort_values('timestamp', inplace=True)
+            all_data.set_index('timestamp', inplace=True)
+            
+        return all_data
+    
+    def _fetch_metric(
+        self,
+        metric: str,
+        start_dt: datetime,
+        end_dt: datetime
+    ) -> pd.DataFrame:
+        """
+        Fetch a single metric from CryptoQuant API.
+        
+        Args:
+            metric: Metric name
+            start_dt: Start date as datetime
+            end_dt: End date as datetime
+            
+        Returns:
+            DataFrame with the requested metric
+        """
+        # Format dates for API
+        start_str = start_dt.strftime('%Y-%m-%d')
+        end_str = end_dt.strftime('%Y-%m-%d')
+        
+        # Prepare API endpoint
+        endpoint = f"/asset/{self.asset}/metric/{metric}"
+        url = f"{self.base_url}{endpoint}"
+        
+        # Prepare query parameters
+        params = {
+            'api_key': self.api_key,
+            'window': self.interval,
+            'from': start_str,
+            'to': end_str
+        }
+        
+        # Make API request
+        response = requests.get(url, params=params)
+        
+        # Check for errors
+        if response.status_code != 200:
+            error_msg = f"API error ({response.status_code}): {response.text}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+            
+        # Parse response
+        data = response.json()
+        
+        # Check if data contains results
+        if 'result' not in data or not data['result']:
+            logging.warning(f"No data returned for metric {metric}")
+            return pd.DataFrame()
+            
+        # Convert to DataFrame
+        result_df = pd.DataFrame(data['result'])
+        
+        # Rename columns to include metric name
+        if 'value' in result_df.columns:
+            result_df.rename(columns={'value': metric}, inplace=True)
+            
+        # Ensure timestamp is datetime
+        if 'timestamp' in result_df.columns:
+            result_df['timestamp'] = pd.to_datetime(result_df['timestamp'])
+            
+        return result_df
+    
+    def get_exchange_flow_data(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        Get exchange flow data (inflows, outflows, netflow).
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with exchange flow metrics
+        """
+        flow_metrics = [
+            'exchange_inflow',
+            'exchange_outflow',
+            'exchange_netflow',
+        ]
+        
+        return self.fetch_data(start_date, end_date, flow_metrics)
+    
+    def get_order_book_data(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        Get order book data (depth, buy/sell pressure).
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with order book metrics
+        """
+        order_book_metrics = [
+            'order_book_depth_bid',
+            'order_book_depth_ask',
+            'buy_sell_ratio'
+        ]
+        
+        return self.fetch_data(start_date, end_date, order_book_metrics)
+    
+    def get_market_data(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        Get market data (price, volume).
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with market metrics
+        """
+        market_metrics = [
+            'price_close',
+            'volume',
+            'market_cap'
+        ]
+        
+        return self.fetch_data(start_date, end_date, market_metrics)
+    
+    def get_sentiment_data(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        Get sentiment data (social sentiment, fear/greed).
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with sentiment metrics
+        """
+        sentiment_metrics = [
+            'social_sentiment',
+            'fear_greed_index'
+        ]
+        
+        # Try to fetch, but generate synthetic if fails
+        try:
+            return self.fetch_data(start_date, end_date, sentiment_metrics)
+        except Exception as e:
+            logging.warning(f"Failed to fetch sentiment data: {str(e)}. Generating synthetic data.")
+            return self._generate_synthetic_sentiment(start_date, end_date)
+    
+    def _generate_synthetic_sentiment(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        Generate synthetic sentiment data when API fails.
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            DataFrame with synthetic sentiment metrics
+        """
+        # Fetch market data to base synthetic sentiment on
+        market_data = self.get_market_data(start_date, end_date)
+        
+        if market_data.empty:
+            raise ValueError("Cannot generate synthetic sentiment without market data")
+            
+        # Create date range
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        date_range = pd.date_range(start=start_dt, end=end_dt, freq='D')
+        
+        # Create empty DataFrame
+        sentiment_df = pd.DataFrame(index=date_range)
+        sentiment_df.index.name = 'timestamp'
+        
+        # Add synthetic social sentiment (-1 to 1)
+        # Base it on 7-day price returns with noise
+        if 'price_close' in market_data.columns:
+            price_resampled = market_data['price_close'].resample('D').last().ffill()
+            returns = price_resampled.pct_change(7)
+            
+            # Normalize to [-1, 1] range
+            max_abs_return = max(abs(returns.min()), abs(returns.max()))
+            normalized_returns = returns / max_abs_return if max_abs_return > 0 else returns
+            
+            # Add noise
+            np.random.seed(42)  # For reproducibility
+            noise = np.random.normal(0, 0.2, len(normalized_returns))
+            
+            sentiment = normalized_returns + noise
+            sentiment = np.clip(sentiment, -1, 1)
+            
+            sentiment_df['social_sentiment'] = sentiment
+            
+        # Add synthetic fear/greed index (0 to 100)
+        if 'price_close' in market_data.columns:
+            # Calculate volatility
+            price_resampled = market_data['price_close'].resample('D').last().ffill()
+            returns = price_resampled.pct_change()
+            volatility = returns.rolling(window=20).std() * 100
+            
+            # Calculate momentum
+            momentum = price_resampled.pct_change(20)
+            
+            # Normalize to [0, 50] range
+            norm_volatility = 50 - (volatility / volatility.max() * 50) if not volatility.empty else pd.Series(25, index=volatility.index)
+            
+            mom_min = momentum.min()
+            mom_max = momentum.max()
+            range_diff = mom_max - mom_min
+            
+            if range_diff > 0:
+                norm_momentum = (momentum - mom_min) / range_diff * 50
+            else:
+                norm_momentum = pd.Series(25, index=momentum.index)
+                
+            # Combine for fear/greed index
+            fear_greed = norm_volatility + norm_momentum
+            fear_greed = np.clip(fear_greed, 0, 100)
+            
+            sentiment_df['fear_greed_index'] = fear_greed
+            
+        return sentiment_df

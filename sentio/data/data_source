@@ -1,0 +1,33 @@
+# sentio/data/data_source.py
+from abc import ABC, abstractmethod
+import pandas as pd
+from typing import Dict, Any, List, Optional
+
+class DataSource(ABC):
+    """
+    Abstract base class for all data sources.
+    
+    This class defines the interface that all data sources must implement.
+    Data sources are responsible for fetching and preprocessing data from
+    various providers (APIs, files, databases, etc.).
+    """
+    
+    @abstractmethod
+    def fetch_data(
+        self,
+        start_date: str,
+        end_date: str,
+        metrics: List[str]
+    ) -> pd.DataFrame:
+        """
+        Fetch data from the source.
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            metrics: List of metric names to fetch
+            
+        Returns:
+            DataFrame with requested metrics
+        """
+        pass

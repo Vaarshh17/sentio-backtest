@@ -1,0 +1,379 @@
+# sentio/data/data_manager.py
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Optional, Union
+import logging
+from datetime import datetime, timedelta
+
+from dummy_modules import DummyDataSource as DataSource
+
+class DataManager:
+    """
+    Manages data loading, preprocessing, and feature engineering.
+    
+    This class is responsible for coordinating data sources, handling
+    missing data, aligning timestamps, and generating derived features.
+    """
+    
+    def __init__(self):
+        """Initialize the DataManager."""
+        self.data_sources = {}
+        self.data_cache = {}
+        
+    def add_data_source(self, name: str, source: DataSource) -> None:
+        """
+        Add a data source.
+        
+        Args:
+            name: Unique identifier for the data source
+            source: DataSource instance
+        """
+        if name in self.data_sources:
+            logging.warning(f"Overwriting existing data source: {name}")
+            
+        self.data_sources[name] = source
+        logging.info(f"Added data source: {name}")
+        
+    def remove_data_source(self, name: str) -> None:
+        """
+        Remove a data source.
+        
+        Args:
+            name: Data source identifier
+        """
+        if name in self.data_sources:
+            del self.data_sources[name]
+            logging.info(f"Removed data source: {name}")
+        else:
+            logging.warning(f"Data source not found: {name}")
+            
+    def get_data(
+        self,
+        source_name: str,
+        start_date: str,
+        end_date: str,
+        metrics: List[str],
+        use_cache: bool = True
+    ) -> pd.DataFrame:
+        """
+        Get data from a specific source.
+        
+        Args:
+            source_name: Data source identifier
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            metrics: List of metrics to fetch
+            use_cache: Whether to use cached data
+            
+        Returns:
+            DataFrame with requested data
+        """
+        # Check if the source exists
+        if source_name not in self.data_sources:
+            raise ValueError(f"Data source not found: {source_name}")
+            
+        # Create cache key
+        cache_key = f"{source_name}_{start_date}_{end_date}_{'-'.join(sorted(metrics))}"
+        
+        # Check if data is in cache
+        if use_cache and cache_key in self.data_cache:
+            logging.info(f"Using cached data for {source_name}")
+            return self.data_cache[cache_key]
+            
+        # Fetch data from source
+        source = self.data_sources[source_name]
+        data = source.fetch_data(start_date, end_date, metrics)
+        
+        # Store in cache
+        if use_cache:
+            self.data_cache[cache_key] = data
+            
+        return data
+    
+    def get_combined_data(
+        self,
+        sources_and_metrics: Dict[str, List[str]],
+        start_date: str,
+        end_date: str,
+        use_cache: bool = True
+    ) -> pd.DataFrame:
+        """
+        Get and combine data from multiple sources.
+        
+        Args:
+            sources_and_metrics: Dict mapping source names to lists of metrics
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            use_cache: Whether to use cached data
+            
+        Returns:
+            DataFrame with combined data from all sources
+        """
+        combined_data = None
+        
+        for source_name, metrics in sources_and_metrics.items():
+            try:
+                source_data = self.get_data(
+                    source_name, start_date, end_date, metrics, use_cache
+                )
+                
+                if combined_data is None:
+                    combined_data = source_data
+                else:
+                    # Join the data on index (timestamp)
+                    combined_data = combined_data.join(source_data, how='outer')
+                    
+            except Exception as e:
+                logging.error(f"Failed to get data from {source_name}: {str(e)}")
+                continue
+                
+        # Sort by index (timestamp)
+        if combined_data is not None:
+            combined_data.sort_index(inplace=True)
+            
+        return combined_data if combined_data is not None else pd.DataFrame()
+    
+    def resample_data(
+        self,
+        data: pd.DataFrame,
+        interval: str,
+        aggregation_methods: Dict[str, str] = None
+    ) -> pd.DataFrame:
+        """
+        Resample data to a specific interval.
+        
+        Args:
+            data: DataFrame to resample
+            interval: Target interval (e.g., '1h', '1d')
+            aggregation_methods: Dict mapping column names to aggregation methods
+            
+        Returns:
+            Resampled DataFrame
+        """
+        if data.empty:
+            return data
+            
+        if aggregation_methods is None:
+            # Default aggregation methods
+            aggregation_methods = {}
+            
+            # Apply appropriate default methods based on column names
+            for col in data.columns:
+                if 'price' in col.lower():
+                    # For price data, use OHLC if available, otherwise last
+                    if 'open' in col.lower():
+                        aggregation_methods[col] = 'first'
+                    elif 'high' in col.lower():
+                        aggregation_methods[col] = 'max'
+                    elif 'low' in col.lower():
+                        aggregation_methods[col] = 'min'
+                    elif 'close' in col.lower():
+                        aggregation_methods[col] = 'last'
+                    else:
+                        aggregation_methods[col] = 'last'
+                elif 'volume' in col.lower() or 'flow' in col.lower():
+                    # Sum for cumulative metrics
+                    aggregation_methods[col] = 'sum'
+                elif 'depth' in col.lower() or 'sentiment' in col.lower() or 'index' in col.lower():
+                    # Average for level metrics
+                    aggregation_methods[col] = 'mean'
+                else:
+                    # Default to mean
+                    aggregation_methods[col] = 'mean'
+                    
+        # Resample using the specified methods
+        resampled = data.resample(interval).agg(aggregation_methods)
+        
+        return resampled
+    
+    def align_data(
+        self,
+        data: pd.DataFrame,
+        target_index: pd.DatetimeIndex = None,
+        method: str = 'ffill'
+    ) -> pd.DataFrame:
+        """
+        Align data to a target index or fill missing values.
+        
+        Args:
+            data: DataFrame to align
+            target_index: Target DatetimeIndex (if None, just fill missing values)
+            method: Fill method ('ffill', 'bfill', 'nearest', or None)
+            
+        Returns:
+            Aligned DataFrame
+        """
+        if data.empty:
+            return data
+            
+        if target_index is not None:
+            # Reindex to the target index
+            aligned = data.reindex(target_index)
+        else:
+            aligned = data.copy()
+            
+        # Fill missing values
+        if method is not None:
+            if method == 'ffill':
+                aligned = aligned.ffill()
+            elif method == 'bfill':
+                aligned = aligned.bfill()
+            elif method == 'nearest':
+                aligned = aligned.interpolate(method='nearest')
+                
+        return aligned
+    
+    def add_technical_indicators(
+        self,
+        data: pd.DataFrame,
+        price_col: str = 'price_close',
+        volume_col: str = 'volume',
+        indicators: List[str] = None
+    ) -> pd.DataFrame:
+        """
+        Add technical indicators to the data.
+        
+        Args:
+            data: Input DataFrame
+            price_col: Name of price column
+            volume_col: Name of volume column
+            indicators: List of indicators to add
+            
+        Returns:
+            DataFrame with added technical indicators
+        """
+        if data.empty:
+            return data
+            
+        if price_col not in data.columns:
+            logging.warning(f"Price column '{price_col}' not found in data")
+            return data
+            
+        if indicators is None:
+            indicators = ['sma', 'ema', 'rsi', 'macd', 'bbands', 'atr']
+            
+        result = data.copy()
+        
+        # Calculate indicators
+        for indicator in indicators:
+            try:
+                if indicator == 'sma':
+                    # Simple Moving Average (periods: 10, 20, 50)
+                    for period in [10, 20, 50]:
+                        result[f'sma_{period}'] = data[price_col].rolling(window=period).mean()
+                        
+                elif indicator == 'ema':
+                    # Exponential Moving Average (periods: 10, 20, 50)
+                    for period in [10, 20, 50]:
+                        result[f'ema_{period}'] = data[price_col].ewm(span=period, adjust=False).mean()
+                        
+                elif indicator == 'rsi':
+                    # Relative Strength Index (period: 14)
+                    period = 14
+                    delta = data[price_col].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+                    rs = gain / loss
+                    result['rsi_14'] = 100 - (100 / (1 + rs))
+                    
+                elif indicator == 'macd':
+                    # MACD (12, 26, 9)
+                    ema12 = data[price_col].ewm(span=12, adjust=False).mean()
+                    ema26 = data[price_col].ewm(span=26, adjust=False).mean()
+                    result['macd_line'] = ema12 - ema26
+                    result['macd_signal'] = result['macd_line'].ewm(span=9, adjust=False).mean()
+                    result['macd_histogram'] = result['macd_line'] - result['macd_signal']
+                    
+                elif indicator == 'bbands':
+                    # Bollinger Bands (20, 2)
+                    period = 20
+                    std_dev = 2
+                    sma = data[price_col].rolling(window=period).mean()
+                    std = data[price_col].rolling(window=period).std()
+                    result['bbands_upper'] = sma + std_dev * std
+                    result['bbands_middle'] = sma
+                    result['bbands_lower'] = sma - std_dev * std
+                    
+                elif indicator == 'atr':
+                    # Average True Range (14)
+                    period = 14
+                    if 'price_high' in data.columns and 'price_low' in data.columns:
+                        high = data['price_high']
+                        low = data['price_low']
+                        close = data[price_col]
+                        
+                        # Calculate True Range
+                        tr1 = high - low
+                        tr2 = abs(high - close.shift())
+                        tr3 = abs(low - close.shift())
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        
+                        # Calculate ATR
+                        result['atr_14'] = tr.rolling(window=period).mean()
+                    else:
+                        # If high/low not available, use approximation
+                        result['atr_14'] = data[price_col].rolling(window=period).std()
+                        
+            except Exception as e:
+                logging.error(f"Failed to calculate {indicator}: {str(e)}")
+                
+        return result
+    
+    def add_liquidity_flow_features(
+        self,
+        data: pd.DataFrame,
+        lookback_periods: List[int] = None
+    ) -> pd.DataFrame:
+        """
+        Add liquidity flow features for the Liquidity Flow Hidden Regime strategy.
+        
+        Args:
+            data: Input DataFrame
+            lookback_periods: List of lookback periods in hours
+            
+        Returns:
+            DataFrame with added liquidity flow features
+        """
+        if data.empty:
+            return data
+            
+        required_columns = ['exchange_inflow', 'exchange_outflow', 'net_flow']
+        missing_columns = [col for col in required_columns if col not in data.columns]
+        
+        if missing_columns:
+            # If net_flow is missing but inflow/outflow are present, calculate it
+            if 'net_flow' in missing_columns and 'exchange_inflow' in data.columns and 'exchange_outflow' in data.columns:
+                data['net_flow'] = data['exchange_inflow'] - data['exchange_outflow']
+                missing_columns.remove('net_flow')
+                
+            # If any columns are still missing, return
+            if missing_columns:
+                missing_str = ', '.join(missing_columns)
+                logging.warning(f"Missing required columns for liquidity features: {missing_str}")
+                return data
+                
+        if lookback_periods is None:
+            lookback_periods = [4, 12, 24, 48, 168]  # hours
+            
+        result = data.copy()
+        
+        # Calculate cumulative net flows over different lookback periods
+        for period in lookback_periods:
+            result[f'net_flow_{period}h'] = data['net_flow'].rolling(window=period).sum()
+            
+        # Calculate inflow/outflow ratio
+        result['flow_ratio'] = data['exchange_inflow'] / data['exchange_outflow'].replace(0, 1e-8)
+        
+        # Calculate exponentially weighted flow metrics
+        for period in [24, 48]:
+            result[f'net_flow_ewm_{period}h'] = data['net_flow'].ewm(span=period, adjust=False).mean()
+            
+        # Calculate flow momentum (change in flow rate)
+        result['flow_momentum'] = result['net_flow_24h'].diff()
+        
+        # Calculate order book imbalance if available
+        if 'order_book_depth_bid' in data.columns and 'order_book_depth_ask' in data.columns:
+            result['ob_imbalance'] = (data['order_book_depth_bid'] - data['order_book_depth_ask']) / (
+                data['order_book_depth_bid'] + data['order_book_depth_ask'])
+                
+        return result
